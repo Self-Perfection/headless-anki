@@ -14,4 +14,4 @@ else
     fi
 fi
 
-anki -b /data
+exec anki -b /data
