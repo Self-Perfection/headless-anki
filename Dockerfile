@@ -1,63 +1,63 @@
-FROM debian:12.4-slim
+FROM python:3.13-slim
 
-ARG ANKICONNECT_VERSION=25.2.25.0
-ARG ANKI_VERSION=25.02.4
-ARG QT_VERSION=6
+ARG ANKICONNECT_VERSION=25.11.9.0
+# aqt/anki are published on PyPI; this is the same code the official Linux
+# "launcher" installs into a venv at first run, but pinned and baked in here so
+# the image is reproducible and needs no network at runtime.
+ARG ANKI_VERSION=25.9.4
 
-RUN apt update && apt install --no-install-recommends -y \
-        wget zstd mpv locales curl git ca-certificates jq libxcb-xinerama0 libxcb-cursor0 libnss3 \
-        libxcomposite-dev libxdamage-dev libxtst-dev libxkbcommon-dev libxkbfile-dev
-RUN useradd -m anki
+# Runtime shared libraries needed by PyQt6 + QtWebEngine when running headless
+# under the offscreen platform plugin. The GTK/cairo/pango theme stack is
+# deliberately omitted -- it is not loaded under offscreen.
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        jq libgl1 libegl1 libglib2.0-0t64 \
+        libnss3 libfontconfig1 libfreetype6 libdbus-1-3 \
+        libcups2t64 libgssapi-krb5-2 libasound2t64 libatomic1 \
+        libxcb-xinerama0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+        libxcb-shape0 libxcb-xkb1 \
+        libxcomposite1 libxdamage1 libxtst6 libxfixes3 libxi6 libxrandr2 \
+        libxrender1 libxkbcommon0 libxkbcommon-x11-0 libxkbfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Anki installation
-RUN mkdir /app && chown -R anki /app
-COPY startup.sh /app/startup.sh
-WORKDIR /app
+# Anki desktop (aqt pulls anki + PyQt6 + QtWebEngine). PyQt6[qt] ships the whole
+# of Qt6; strip the leaf Qt modules nothing in Anki references (3D, charts, SQL,
+# designer, pdf, ...). Modules imported by aqt (QtMultimedia, QtQuick, ...) and
+# pulled in by QtWebEngineCore (QtPositioning, QtWebChannel, QtQml*) are kept.
+RUN pip install --no-cache-dir "aqt[qt]==${ANKI_VERSION}" \
+    && SP="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+    && L="$SP/PyQt6/Qt6/lib" \
+    && for m in 3D Quick3D Pdf Designer Charts DataVisualization Graphs \
+               Sensors SerialPort SerialBus Modbus Bluetooth Nfc Location \
+               Sql Test Help Scxml RemoteObjects WebView TextToSpeech \
+               SpatialAudio; do \
+           rm -f "$L"/libQt6${m}*.so* "$SP"/PyQt6/Qt6${m}*.abi3.so; \
+       done \
+    && rm -rf "$SP/PyQt6/Qt6/plugins/sqldrivers" \
+              "$SP/PyQt6/Qt6/plugins/sensors" \
+              "$SP/PyQt6/Qt6/plugins/geoservices" \
+              "$SP/PyQt6/Qt6/plugins/texttospeech"
 
-RUN wget -O ANKI.tar.zst --no-check-certificate https://github.com/ankitects/anki/releases/download/${ANKI_VERSION}/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}.tar.zst && \
-    zstd -d ANKI.tar.zst && rm ANKI.tar.zst && \
-    tar xfv ANKI.tar && rm ANKI.tar
-WORKDIR /app/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}
+# AnkiConnect plugin (curl is install-only and purged afterwards).
+RUN apt-get update && apt-get install --no-install-recommends -y curl \
+    && mkdir -p /app/anki-connect \
+    && curl -fL "https://git.sr.ht/~foosoft/anki-connect/archive/${ANKICONNECT_VERSION}.tar.gz" \
+        | tar -xz -C /app/anki-connect --strip-components=1 \
+    && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
-# Run modified install.sh
-RUN cat install.sh | sed 's/xdg-mime/#/' | sh -
-
-# Post process
-RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
-    dpkg-reconfigure --frontend=noninteractive locales && \
-    update-locale LANG=en_US.UTF-8
-ENV LANG=en_US.UTF-8 \ LANGUAGE=en_US \ LC_ALL=en_US.UTF-8
-
-RUN apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
-
-# Anki volumes
+# Anki profile + AnkiConnect wiring, listening on all interfaces with open CORS
+# so the JSON API is reachable from outside the container with a plain request.
 ADD data /data
-RUN mkdir /data/addons21 && chown -R anki /data
+RUN mkdir -p /data/addons21 \
+    && ln -sf /app/anki-connect/plugin /data/addons21/AnkiConnectDev \
+    && jq '.webBindAddress = "0.0.0.0" | .webCorsOriginList = ["*"]' \
+        /app/anki-connect/plugin/config.json > /tmp/c \
+    && mv /tmp/c /app/anki-connect/plugin/config.json \
+    && useradd -m anki && chown -R anki:anki /app /data
 VOLUME /data
 
-RUN mkdir /export && chown -R anki /export
-VOLUME /export
-
-# Plugin installation
-WORKDIR /app
-RUN curl -L https://git.sr.ht/~foosoft/anki-connect/archive/${ANKICONNECT_VERSION}.tar.gz | \
-    tar -xz && \
-    mv anki-connect-${ANKICONNECT_VERSION} anki-connect
-RUN chown -R anki:anki /app/anki-connect/plugin && \
-    ln -s -f /app/anki-connect/plugin /data/addons21/AnkiConnectDev
-
-# Edit AnkiConnect config
-RUN jq '.webBindAddress = "0.0.0.0"' /data/addons21/AnkiConnectDev/config.json > tmp_file && \
-    mv tmp_file /data/addons21/AnkiConnectDev/config.json
-
 USER anki
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    QT_QPA_PLATFORM=offscreen
 
-ENV ANKICONNECT_WILDCARD_ORIGIN="0"
-ENV QMLSCENE_DEVICE=softwarecontext
-ENV FONTCONFIG_PATH=/etc/fonts
-ENV QT_XKB_CONFIG_ROOT=/usr/share/X11/xkb
-ENV QT_QPA_PLATFORM="vnc"
-# Could also use "offscreen"
-
-CMD ["/bin/bash", "startup.sh"]
+CMD ["python", "-c", "import sys; sys.argv = ['anki', '-b', '/data']; import aqt; aqt.run()"]
