@@ -1,55 +1,58 @@
-FROM debian:12.4-slim
+FROM debian:13-slim
 
-ARG ANKICONNECT_VERSION=25.2.25.0
-ARG ANKI_VERSION=25.02.4
+ARG ANKICONNECT_VERSION=25.11.9.0
+ARG ANKI_VERSION=25.02.7
 ARG QT_VERSION=6
 
-RUN apt update && apt install --no-install-recommends -y \
-        wget zstd mpv locales curl git ca-certificates jq libxcb-xinerama0 libxcb-cursor0 libnss3 \
-        libxcomposite-dev libxdamage-dev libxtst-dev libxkbcommon-dev libxkbfile-dev
-RUN useradd -m anki
+# Runtime dependencies. Same set as before, but the five lib*-dev packages are
+# replaced by their runtime shared-library equivalents (no headers needed at
+# runtime), and wget/zstd/curl/git are dropped here -- they are install-time only
+# and handled in the build layer below, so they never ship in the final image.
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        ca-certificates jq mpv \
+        libnss3 libxcb-xinerama0 libxcb-cursor0 \
+        libxcomposite1 libxdamage1 libxtst6 libxkbcommon0 libxkbfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Anki installation
-RUN mkdir /app && chown -R anki /app
-COPY startup.sh /app/startup.sh
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+RUN useradd -m anki && mkdir /app && chown anki /app
 WORKDIR /app
 
-RUN wget -O ANKI.tar.zst --no-check-certificate https://github.com/ankitects/anki/releases/download/${ANKI_VERSION}/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}.tar.zst && \
-    zstd -d ANKI.tar.zst && rm ANKI.tar.zst && \
-    tar xfv ANKI.tar && rm ANKI.tar
-WORKDIR /app/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}
-
-# Run modified install.sh
-RUN cat install.sh | sed 's/xdg-mime/#/' | sh -
-
-# Post process
-RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
-    dpkg-reconfigure --frontend=noninteractive locales && \
-    update-locale LANG=en_US.UTF-8
-ENV LANG=en_US.UTF-8 \ LANGUAGE=en_US \ LC_ALL=en_US.UTF-8
-
-RUN apt-get autoremove -y && \
+# Download + install Anki and AnkiConnect in a single layer. The install-only
+# tools (curl, zstd) are purged at the end of the layer, and the extracted Anki
+# source tree is removed after install.sh copies it into /usr/local, so the
+# ~490 MB bundle is no longer duplicated in the image.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install --no-install-recommends -y curl zstd; \
+    # Anki desktop bundle
+    curl -fL -o /tmp/anki.tar.zst \
+        "https://github.com/ankitects/anki/releases/download/${ANKI_VERSION}/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}.tar.zst"; \
+    mkdir -p /tmp/anki; \
+    tar -x --zstd -f /tmp/anki.tar.zst -C /tmp/anki --strip-components=1; \
+    ( cd /tmp/anki && sed 's/xdg-mime/#/' install.sh | sh - ); \
+    rm -rf /tmp/anki /tmp/anki.tar.zst; \
+    # AnkiConnect plugin
+    mkdir -p /app/anki-connect; \
+    curl -fL "https://git.sr.ht/~foosoft/anki-connect/archive/${ANKICONNECT_VERSION}.tar.gz" \
+        | tar -xz -C /app/anki-connect --strip-components=1; \
+    # drop install-only tooling
+    apt-get purge -y curl zstd; \
+    apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
-# Anki volumes
+COPY startup.sh /app/startup.sh
+
+# Anki profile + AnkiConnect wiring (built ahead of time, no interactive setup).
 ADD data /data
-RUN mkdir /data/addons21 && chown -R anki /data
+RUN mkdir -p /data/addons21 /export \
+    && ln -sf /app/anki-connect/plugin /data/addons21/AnkiConnectDev \
+    && jq '.webBindAddress = "0.0.0.0"' /app/anki-connect/plugin/config.json > /tmp/c \
+    && mv /tmp/c /app/anki-connect/plugin/config.json \
+    && chown -R anki:anki /app /data /export
 VOLUME /data
-
-RUN mkdir /export && chown -R anki /export
 VOLUME /export
-
-# Plugin installation
-WORKDIR /app
-RUN curl -L https://git.sr.ht/~foosoft/anki-connect/archive/${ANKICONNECT_VERSION}.tar.gz | \
-    tar -xz && \
-    mv anki-connect-${ANKICONNECT_VERSION} anki-connect
-RUN chown -R anki:anki /app/anki-connect/plugin && \
-    ln -s -f /app/anki-connect/plugin /data/addons21/AnkiConnectDev
-
-# Edit AnkiConnect config
-RUN jq '.webBindAddress = "0.0.0.0"' /data/addons21/AnkiConnectDev/config.json > tmp_file && \
-    mv tmp_file /data/addons21/AnkiConnectDev/config.json
 
 USER anki
 
@@ -60,4 +63,4 @@ ENV QT_XKB_CONFIG_ROOT=/usr/share/X11/xkb
 ENV QT_QPA_PLATFORM="vnc"
 # Could also use "offscreen"
 
-CMD ["/bin/bash", "startup.sh"]
+CMD ["/bin/bash", "/app/startup.sh"]
