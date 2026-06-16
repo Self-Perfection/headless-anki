@@ -2,9 +2,7 @@ ARG ANKICONNECT_VERSION=25.11.9.0
 ARG ANKI_VERSION=25.02.7
 ARG QT_VERSION=6
 
-# --- build stage: fetch + install Anki and AnkiConnect ---
-# Everything install-only (curl, zstd) lives here and never reaches the final
-# image, so there is no purge/autoremove dance.
+# --- Build: Install Anki and AnkiConnect ---
 FROM debian:13-slim AS build
 ARG ANKICONNECT_VERSION
 ARG ANKI_VERSION
@@ -15,7 +13,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    # Anki desktop bundle -> /usr/local (install.sh, xdg-mime stubbed out)
+    # Anki desktop bundle -> /usr/local
     curl -fL -o /tmp/anki.tar.zst \
         "https://github.com/ankitects/anki/releases/download/${ANKI_VERSION}/anki-${ANKI_VERSION}-linux-qt${QT_VERSION}.tar.zst"; \
     mkdir -p /tmp/anki; \
@@ -26,11 +24,8 @@ RUN set -eux; \
     curl -fL "https://git.sr.ht/~foosoft/anki-connect/archive/${ANKICONNECT_VERSION}.tar.gz" \
         | tar -xz -C /app/anki-connect --strip-components=1
 
-# --- final stage ---
+# --- Final stage ---
 FROM debian:13-slim
-ARG ANKICONNECT_VERSION
-ARG ANKI_VERSION
-ARG QT_VERSION
 
 # Dependencies
 RUN apt-get update && apt-get install --no-install-recommends -y \
